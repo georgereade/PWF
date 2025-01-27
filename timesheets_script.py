@@ -28,7 +28,7 @@ headers = {
 pd.set_option('display.max_colwidth', None)
 
 trackedfrom = '2024-01-01'  # Specify start date for the time range
-trackedto = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')    # Specify end date for the time range
+trackedto = '2024-12-31'   # Specify end date for the time range
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
@@ -53,17 +53,17 @@ def get_contact_task_details(contact_id, trackedfrom, trackedto):
         raise Exception(f"Error fetching task details for contact {contact_id}: {response.status_code}, {response.text}")
 
 def format_time(iso_time):
-    return pd.to_datetime(iso_time).time()
+    return pd.to_datetime(iso_time)
 
 # Function to calculate time spent between start and end times
 def calculate_time_spent(start_time, end_time):
     start = pd.to_datetime(start_time)
     end = pd.to_datetime(end_time)
     time_spent = (end - start).total_seconds() / 60  # Time spent in minutes
-    return format_time(time_spent)
-    # return f"{int(time_spent // 60)}:{int(time_spent % 60):02d}"  # Return formatted HH:MM
+    # return format_time(time_spent)
+    return f"{int(time_spent // 60)}:{int(time_spent % 60):02d}"  # Return formatted HH:MM
     
-def get_last_paid_invoice_date(project_id, max_retries=3, backoff_factor=2):
+def get_first_day_of_month_in_last_paid_invoice_date(project_id, max_retries=3, backoff_factor=2):
     url = f"{BASE_URL}/projects/{project_id}/invoices/"
     retries = 0
     
@@ -74,9 +74,23 @@ def get_last_paid_invoice_date(project_id, max_retries=3, backoff_factor=2):
                 invoices = response.json().get('invoices', [])
                 # paid_invoices = [inv for inv in invoices if inv['status'] == 'paid']
                 if invoices:
+                    # Find the invoice with the latest date
                     latest_invoice = max(invoices, key=lambda inv: inv['invoiceddate'])
-                    print(f"Last paid invoice for project {project_id} found: {latest_invoice['invoiceddate']}")
-                    return latest_invoice['invoiceddate']
+                    latest_invoiced_date = latest_invoice['invoiceddate']
+
+                    # Convert to datetime if it's a string
+                    if isinstance(latest_invoiced_date, str):
+                        latest_invoiced_date = datetime.strptime(latest_invoiced_date, "%Y-%m-%dT%H:%M:%S")
+
+                    # Set to the first day of the month
+                    first_day_of_month = latest_invoiced_date.replace(day=1)
+
+                    # Format as 'YYYY-MM-DDTHH:MM:SS'
+                    formatted_date = first_day_of_month.strftime("%Y-%m-%dT%H:%M:%S")
+
+                    print(f"Last paid invoice for project {project_id} found: {latest_invoiced_date} (adjusted to {formatted_date})")
+                    return formatted_date
+
                 return None
             elif response.status_code >= 500:
                 # Server error, so we should retry
@@ -135,7 +149,7 @@ def process_time_per_contact(trackedfrom, trackedto):
             project_number = record['projectnumber']
 
             # Get the last paid invoice date for the project
-            last_paid_invoice_date = get_last_paid_invoice_date(project_id)
+            last_paid_invoice_date = get_first_day_of_month_in_last_paid_invoice_date(project_id)
             if last_paid_invoice_date:
                 last_paid_invoice_date = pd.to_datetime(last_paid_invoice_date)
             else: last_paid_invoice_date = pd.to_datetime(record['starttime'])
@@ -296,7 +310,7 @@ def main():
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects'
+    output_dir = 'output/projects/December 2024'
     os.makedirs(output_dir, exist_ok=True)
 
     # Write each project's data to a separate Excel file
@@ -335,7 +349,7 @@ def main():
             def format_time_spent_as_duration(worksheet, column_letter, start_row, end_row):
                 for row in range(start_row, end_row + 1):
                     cell = worksheet[f"{column_letter}{row}"]
-                    cell.number_format = '[hh]:mm:ss'  # Format as duration in hours and minutes
+                    cell.number_format = '[hh]:mm'  # Format as duration in hours and minutes
             
             # Determine the column letter and row range for "Time Spent" column
             time_spent_col = 'H'  # Adjust if "Time Spent" is in a different column
