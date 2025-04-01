@@ -27,8 +27,8 @@ headers = {
 
 pd.set_option('display.max_colwidth', None)
 
-trackedfrom = '2024-01-01'  # Specify start date for the time range
-trackedto = '2024-12-31'   # Specify end date for the time range
+trackedfrom = '2024-06-01'  # Specify start date for the time range
+trackedto = '2025-03-31'   # Specify end date for the time range
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
@@ -310,7 +310,7 @@ def main():
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects/December 2024'
+    output_dir = 'output/projects/March 2025'
     os.makedirs(output_dir, exist_ok=True)
 
     # Write each project's data to a separate Excel file
