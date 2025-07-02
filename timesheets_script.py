@@ -1,15 +1,14 @@
-import requests
-from requests.auth import HTTPBasicAuth
 import os
-from dotenv import load_dotenv
-import pandas as pd
 import time
-
 from datetime import datetime, timedelta
 
 import openpyxl
+import pandas as pd
+import requests
+from dotenv import load_dotenv
+from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
-from openpyxl.styles import PatternFill, Font, Alignment
+from requests.auth import HTTPBasicAuth
 
 load_dotenv()
 
@@ -27,8 +26,8 @@ headers = {
 
 pd.set_option('display.max_colwidth', None)
 
-trackedfrom = '2024-06-01'  # Specify start date for the time range
-trackedto = '2025-03-31'   # Specify end date for the time range
+trackedfrom = '2024-10-01'  # Specify start date for the time range
+trackedto = '2025-06-30'   # Specify end date for the time range
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
@@ -113,6 +112,47 @@ def get_first_day_of_month_in_last_paid_invoice_date(project_id, max_retries=3, 
     print(f"Failed to get invoices for project {project_id} after {max_retries} retries. Skipping project.")
     return None
 
+def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
+    url = f"{BASE_URL}/projects/{project_id}/invoices/"
+    retries = 0
+
+    while retries < max_retries:
+        try:
+            response = requests.get(url, headers=headers, auth=HTTPBasicAuth(USERNAME, PASSWORD))
+            if response.status_code == 200:
+                invoices = response.json().get('invoices', [])
+                if invoices:
+                    # Find the invoice with the latest date
+                    latest_invoice = max(invoices, key=lambda inv: inv['invoiceddate'])
+                    latest_invoiced_date = latest_invoice['invoiceddate']
+
+                    # Convert to datetime if it's a string
+                    if isinstance(latest_invoiced_date, str):
+                        latest_invoiced_date = datetime.strptime(latest_invoiced_date, "%Y-%m-%dT%H:%M:%S")
+
+                    formatted_date = latest_invoiced_date.strftime("%Y-%m-%dT%H:%M:%S")
+
+                    print(f"Last invoice for project {project_id} found: {formatted_date}")
+                    return formatted_date
+
+                return None
+            elif response.status_code >= 500:
+                retries += 1
+                wait_time = backoff_factor ** retries
+                print(f"Server error {response.status_code} for project {project_id}. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)
+            else:
+                print(f"Client error {response.status_code} for project {project_id}: {response.text}")
+                return None
+        except requests.exceptions.RequestException as e:
+            retries += 1
+            wait_time = backoff_factor ** retries
+            print(f"Network error for project {project_id}: {e}. Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+
+    print(f"Failed to get invoices for project {project_id} after {max_retries} retries. Skipping project.")
+    return None
+
 # Calculate the start and end dates for the previous month
 def get_previous_month_dates():
     today = datetime.today()
@@ -148,20 +188,17 @@ def process_time_per_contact(trackedfrom, trackedto):
             project_name = record['projecttitle']
             project_number = record['projectnumber']
 
-            # Get the last paid invoice date for the project
-            last_paid_invoice_date = get_first_day_of_month_in_last_paid_invoice_date(project_id)
-            if last_paid_invoice_date:
-                last_paid_invoice_date = pd.to_datetime(last_paid_invoice_date)
-            else: last_paid_invoice_date = pd.to_datetime(record['starttime'])
+            # Get the last invoice date for the project (actual date, not first of month)
+            last_invoice_date = get_last_invoice_date(project_id)
+            if last_invoice_date:
+                last_invoice_date = pd.to_datetime(last_invoice_date)
+            else:
+                last_invoice_date = pd.to_datetime(record['starttime'])
 
-            # # If no last invoice found, set to default
-            # if last_paid_invoice_date is None:
-            #     last_paid_invoice_date = record['starttime']
-
-            # Check if the task's end_time is after the last paid invoice date
+            # Check if the task's end_time is after the last invoice date
             end_time = pd.to_datetime(record['endtime'])
-            if end_time < last_paid_invoice_date:
-                print(f"Removing task '{record['taskname']}' for project '{project_name}' because its end time is before the last paid invoice date.")
+            if end_time < last_invoice_date:
+                print(f"Removing task '{record['taskname']}' for project '{project_name}' because its end time is before the last invoice date.")
                 continue
 
             # Store the record in the project's time records
@@ -310,13 +347,13 @@ def main():
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects/March 2025'
+    output_dir = 'output/projects/June 2025v3'
     os.makedirs(output_dir, exist_ok=True)
 
-    # Write each project's data to a separate Excel file
+        # Write each project's data to a separate Excel file
     for project_name, records in project_data_tasks.items():
         df_tasks = pd.DataFrame(project_data_tasks.get(project_name, []))  # Get task details, if available
-        
+
         # Replace invalid characters in project names that can't be used in file names
         safe_project_name = "".join([c if c.isalnum() or c in (' ', '-', '_') else '_' for c in project_name])
         formatted_date = datetime.now().strftime('%b %Y')
@@ -324,46 +361,41 @@ def main():
         df_tasks.drop(columns=['Project Number'], inplace=True, errors='ignore')
         excel_file = f'{output_dir}/{project_number} - {safe_project_name} {formatted_date} Timesheet.xlsx'
 
+        # Convert "Time Spent" from "HH:MM" string to Excel duration (fraction of a day)
+        df_tasks['Time Spent'] = df_tasks['Time Spent'].apply(lambda x: int(x.split(':')[0]) * 60 + int(x.split(':')[1]))  # minutes
+        df_tasks['Time Spent'] = df_tasks['Time Spent'] / 1440  # convert to Excel duration
+
         # Create pivot table for total time spent by each staff member
-        df_tasks['Time Spent in Minutes'] = df_tasks['Time Spent'].apply(lambda x: int(x.split(':')[0]) * 60 + int(x.split(':')[1]))
+        df_tasks['Time Spent in Minutes'] = df_tasks['Time Spent'] * 1440
         pivot_df = df_tasks.pivot_table(index='Staff', values='Time Spent in Minutes', aggfunc='sum').reset_index()
-
-        # Convert the total time spent back to HH:MM format
-        pivot_df['Total Time Spent (HH:MM)'] = pivot_df['Time Spent in Minutes'].apply(lambda x: f"{x//60}:{x%60:02d}")
-
-        # Remove the 'Time Spent in Minutes' column as requested in the pivot table
+        pivot_df['Total Time Spent (HH:MM)'] = pivot_df['Time Spent in Minutes'].apply(lambda x: f"{int(x)//60}:{int(x)%60:02d}")
         pivot_df = pivot_df[['Staff', 'Total Time Spent (HH:MM)']]
-
-        # Drop the 'Time Spent in Minutes' from df_tasks to prevent it from appearing in the final Excel output
         df_tasks.drop(columns=['Time Spent in Minutes'], inplace=True)
 
-        # Calculate the sum of total time spent in minutes
         total_time_minutes = pivot_df['Total Time Spent (HH:MM)'].apply(lambda x: int(x.split(':')[0]) * 60 + int(x.split(':')[1])).sum()
         total_time_formatted = f"{total_time_minutes // 60}:{total_time_minutes % 60:02d}"
 
         # Write DataFrame to Excel
         with pd.ExcelWriter(excel_file, engine='openpyxl') as writer:
-            df_tasks.to_excel(writer, sheet_name='Task Details', index=False, startrow=1)  # Shift down by 1 rows
+            df_tasks.to_excel(writer, sheet_name='Task Details', index=False, startrow=1)  # Shift down by 1 row
 
-                # Format "Time Spent" column as duration
-            def format_time_spent_as_duration(worksheet, column_letter, start_row, end_row):
-                for row in range(start_row, end_row + 1):
-                    cell = worksheet[f"{column_letter}{row}"]
-                    cell.number_format = '[hh]:mm'  # Format as duration in hours and minutes
-            
-            # Determine the column letter and row range for "Time Spent" column
-            time_spent_col = 'H'  # Adjust if "Time Spent" is in a different column
-            start_row = 3  # Row where data starts, adjust as necessary
-            end_row = start_row + len(df_tasks) - 1  # Last row of data
-
-            # Write the pivot table to the same sheet, below the task data
             sheet_name = 'Task Details'
-            workbook = writer.book
             worksheet = writer.sheets[sheet_name]
             last_row = len(df_tasks) + 3  # Add 3 for the extra row and header
 
-            # Apply duration formatting to the "Time Spent" column
-            format_time_spent_as_duration(worksheet, time_spent_col, start_row, end_row)
+            # Find the column letter for "Time Spent"
+            for idx, col in enumerate(df_tasks.columns, 1):
+                if col == "Time Spent":
+                    time_spent_col_letter = get_column_letter(idx)
+                    break
+
+            # Format the "Time Spent" column as duration and set cell value as timedelta
+            for idx, i in enumerate(df_tasks.index, start=3):
+                minutes = int(df_tasks.loc[i, "Time Spent"] * 1440)  # Convert back to minutes
+                td = timedelta(minutes=minutes)
+                cell = worksheet[f"{time_spent_col_letter}{idx}"]
+                cell.value = td  # Set as timedelta object
+                cell.number_format = '[h]:mm:ss'  # Changed from '[h]:mm' to '[h]:mm:ss'
 
             # Add the grouped headers
             add_grouped_headers(worksheet)
@@ -392,7 +424,6 @@ def main():
 
             # Apply the font settings to the entire worksheet
             set_font(worksheet, font_name="Calibri", font_size=10)
-
 
         print(f"Time data and pivot table for project '{project_name}' saved to {excel_file}")
 
