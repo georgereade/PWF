@@ -27,7 +27,7 @@ headers = {
 pd.set_option('display.max_colwidth', None)
 
 trackedfrom = '2024-10-01'  # Specify start date for the time range
-trackedto = '2025-06-30'   # Specify end date for the time range
+trackedto = '2025-08-31'   # Specify end date for the time range
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
@@ -130,9 +130,11 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
                     if isinstance(latest_invoiced_date, str):
                         latest_invoiced_date = datetime.strptime(latest_invoiced_date, "%Y-%m-%dT%H:%M:%S")
 
-                    formatted_date = latest_invoiced_date.strftime("%Y-%m-%dT%H:%M:%S")
+                    # Add one day to the latest invoice date
+                    next_day = latest_invoiced_date + timedelta(days=1)
+                    formatted_date = next_day.strftime("%Y-%m-%dT%H:%M:%S")
 
-                    print(f"Last invoice for project {project_id} found: {formatted_date}")
+                    print(f"Last invoice for project {project_id} found: {formatted_date} (day after latest invoice date)")
                     return formatted_date
 
                 return None
@@ -347,7 +349,7 @@ def main():
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects/June 2025v3'
+    output_dir = 'output/projects/August 2025'
     os.makedirs(output_dir, exist_ok=True)
 
         # Write each project's data to a separate Excel file
