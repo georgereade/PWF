@@ -26,8 +26,8 @@ headers = {
 
 pd.set_option('display.max_colwidth', None)
 
-trackedfrom = '2024-10-01'  # Specify start date for the time range
-trackedto = '2025-08-31'   # Specify end date for the time range
+trackedfrom = '2025-04-01'  # Specify start date for the time range
+trackedto = '2026-05-31'  # Specify end date for the time range
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
@@ -156,12 +156,12 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
     return None
 
 # Calculate the start and end dates for the previous month
-def get_previous_month_dates():
-    today = datetime.today()
-    first_day_this_month = datetime(today.year, today.month, 1)
-    last_day_previous_month = first_day_this_month - timedelta(days=1)
-    first_day_previous_month = datetime(last_day_previous_month.year, last_day_previous_month.month, 1)
-    return first_day_previous_month, last_day_previous_month
+def get_month_dates_for_range(end_date_str):
+    """Get start and end of the month for the specified end date"""
+    end_date = pd.to_datetime(end_date_str)
+    first_day_of_month = end_date.replace(day=1)
+    # Use the input date as the end date
+    return first_day_of_month, end_date
 
 # Function to process both time totals and task details, including all records if a project has records in the previous month
 def process_time_per_contact(trackedfrom, trackedto):
@@ -169,7 +169,7 @@ def process_time_per_contact(trackedfrom, trackedto):
     project_data_tasks = {}
 
     # Get the date range for the previous month
-    prev_month_start, prev_month_end = get_previous_month_dates()
+    prev_month_start, prev_month_end = get_month_dates_for_range(trackedto)
     print(f"Including projects with time records from {prev_month_start.strftime('%b %d, %Y')} to {prev_month_end.strftime('%b %d, %Y')}...")
 
     print("Calculating time per staff member...")
@@ -349,7 +349,7 @@ def main():
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects/August 2025'
+    output_dir = 'output/projects/Timesheets May 2026'
     os.makedirs(output_dir, exist_ok=True)
 
         # Write each project's data to a separate Excel file
@@ -358,10 +358,13 @@ def main():
 
         # Replace invalid characters in project names that can't be used in file names
         safe_project_name = "".join([c if c.isalnum() or c in (' ', '-', '_') else '_' for c in project_name])
-        formatted_date = datetime.now().strftime('%b %Y')
-        project_number = records[0]['Project Number']
+        # previous month using a simple "first of this month minus one day" trick
+        prev_month_date = (datetime.now().replace(day=1) - timedelta(days=1))
+        formatted_date = prev_month_date.strftime('%b %Y')
+
+        project_number = records[0].get('Project Number', '')
         df_tasks.drop(columns=['Project Number'], inplace=True, errors='ignore')
-        excel_file = f'{output_dir}/{project_number} - {safe_project_name} {formatted_date} Timesheet.xlsx'
+        excel_file = os.path.join(output_dir, f"{project_number} - {safe_project_name} {formatted_date} Timesheet.xlsx")
 
         # Convert "Time Spent" from "HH:MM" string to Excel duration (fraction of a day)
         df_tasks['Time Spent'] = df_tasks['Time Spent'].apply(lambda x: int(x.split(':')[0]) * 60 + int(x.split(':')[1]))  # minutes
