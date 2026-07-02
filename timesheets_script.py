@@ -1,7 +1,9 @@
 import os
 import signal
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 
 import openpyxl
@@ -29,19 +31,34 @@ headers = {
 pd.set_option('display.max_colwidth', None)
 
 REQUEST_TIMEOUT_SECONDS = 30
+MAX_CONTACT_FETCH_WORKERS = 8
+MAX_INVOICE_FETCH_WORKERS = 8
 
-trackedfrom = '2025-09-01'  # Specify start date for the time range
+trackedfrom = '2025-04-01'  # Specify start date for the time range
 trackedto = '2026-06-30'  # Specify end date for the time range
 folderName = 'Timesheets June 2026'  # Specify the folder name for output files
 
 # Cache invoice cut-off dates by project to avoid repeated API calls.
 LAST_INVOICE_DATE_CACHE = {}
+STOP_REQUESTED = threading.Event()
+LAST_SIGINT_AT = 0.0
+SIGINT_CONFIRM_WINDOW_SECONDS = 3.0
 
 
 def _interrupt_signal_handler(signum, frame):
-    # Surface where KeyboardInterrupt is coming from when run is cancelled externally.
-    print("\nReceived interrupt signal (SIGINT). This usually means the run was cancelled by the IDE, task runner, or Ctrl+C.")
-    raise KeyboardInterrupt
+    # Ignore a single unexpected SIGINT; require a second one shortly after to stop intentionally.
+    global LAST_SIGINT_AT
+    now = time.monotonic()
+    if now - LAST_SIGINT_AT <= SIGINT_CONFIRM_WINDOW_SECONDS:
+        STOP_REQUESTED.set()
+        print("\nReceived second SIGINT. Stopping now.")
+        raise KeyboardInterrupt
+
+    LAST_SIGINT_AT = now
+    print(
+        "\nReceived SIGINT but continuing (possible IDE/task auto-cancel). "
+        "Press Ctrl+C again within 3s to stop intentionally."
+    )
 
 
 signal.signal(signal.SIGINT, _interrupt_signal_handler)
@@ -145,6 +162,9 @@ def get_first_day_of_month_in_last_paid_invoice_date(project_id, max_retries=3, 
     return None
 
 def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
+    if STOP_REQUESTED.is_set():
+        return None
+
     if project_id in LAST_INVOICE_DATE_CACHE:
         return LAST_INVOICE_DATE_CACHE[project_id]
 
@@ -152,6 +172,10 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
     retries = 0
 
     while retries < max_retries:
+        if STOP_REQUESTED.is_set():
+            LAST_INVOICE_DATE_CACHE[project_id] = None
+            return None
+
         try:
             response = requests.get(
                 url,
@@ -212,6 +236,7 @@ def process_time_per_contact(trackedfrom, trackedto):
     staff_contacts = get_staff_contacts()
     project_data_tasks = {}
     invoice_date_cache = {}
+    invoice_cutoff_dt_cache = {}
 
     # Get the date range for the previous month
     prev_month_start, prev_month_end = get_month_dates_for_range(trackedto)
@@ -219,12 +244,73 @@ def process_time_per_contact(trackedfrom, trackedto):
 
     print("Calculating time per staff member...")
 
-    for contact in staff_contacts:
-        contact_id = contact['id']
-        contact_name = f"{contact['firstname']} {contact['lastname']}"
+    # Fetch all contact task details concurrently (network-bound calls).
+    contact_task_payloads = []
+    executor = ThreadPoolExecutor(max_workers=MAX_CONTACT_FETCH_WORKERS)
+    try:
+        future_to_contact = {
+            executor.submit(get_contact_task_details, contact['id'], trackedfrom, trackedto): (
+                contact['id'],
+                f"{contact['firstname']} {contact['lastname']}",
+            )
+            for contact in staff_contacts
+        }
 
-        # Get task details per project for the specific contact
-        task_details = get_contact_task_details(contact_id, trackedfrom, trackedto)
+        for future in as_completed(future_to_contact):
+            if STOP_REQUESTED.is_set():
+                raise KeyboardInterrupt
+
+            contact_id, contact_name = future_to_contact[future]
+            try:
+                task_details = future.result()
+            except Exception as e:
+                print(f"Skipping contact '{contact_name}' ({contact_id}) due to task fetch error: {e}")
+                continue
+
+            contact_task_payloads.append((contact_name, task_details))
+    except KeyboardInterrupt:
+        executor.shutdown(wait=False, cancel_futures=True)
+        raise
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    unique_project_ids = sorted(
+        {
+            record['projectid']
+            for _, task_details in contact_task_payloads
+            for record in task_details
+        }
+    )
+
+    if unique_project_ids:
+        print(f"Prefetching invoice cut-off dates for {len(unique_project_ids)} projects...")
+        executor = ThreadPoolExecutor(max_workers=MAX_INVOICE_FETCH_WORKERS)
+        try:
+            future_to_project_id = {
+                executor.submit(get_last_invoice_date, project_id): project_id
+                for project_id in unique_project_ids
+            }
+
+            for future in as_completed(future_to_project_id):
+                if STOP_REQUESTED.is_set():
+                    raise KeyboardInterrupt
+
+                project_id = future_to_project_id[future]
+                try:
+                    invoice_date_cache[project_id] = future.result()
+                except Exception as e:
+                    print(f"Invoice prefetch failed for project {project_id}: {e}")
+                    invoice_date_cache[project_id] = None
+        except KeyboardInterrupt:
+            executor.shutdown(wait=False, cancel_futures=True)
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+        for project_id, invoice_date in invoice_date_cache.items():
+            invoice_cutoff_dt_cache[project_id] = pd.to_datetime(invoice_date) if invoice_date else None
+
+    for contact_name, task_details in contact_task_payloads:
 
         # Dictionary to store time records for each project, used to determine if any records fall in the previous month
         project_time_records = {}
@@ -233,22 +319,25 @@ def process_time_per_contact(trackedfrom, trackedto):
         for record in task_details:
             project_id = record['projectid']
             project_name = record['projecttitle']
-            project_number = record['projectnumber']
+            start_dt = pd.to_datetime(record['starttime'])
+            end_dt = pd.to_datetime(record['endtime'])
 
             # Get the last invoice date for the project (actual date, not first of month)
-            if project_id not in invoice_date_cache:
-                invoice_date_cache[project_id] = get_last_invoice_date(project_id)
-            last_invoice_date = invoice_date_cache[project_id]
-            if last_invoice_date:
-                last_invoice_date = pd.to_datetime(last_invoice_date)
-            else:
-                last_invoice_date = pd.to_datetime(record['starttime'])
+            if project_id not in invoice_cutoff_dt_cache:
+                if project_id not in invoice_date_cache:
+                    invoice_date_cache[project_id] = get_last_invoice_date(project_id)
+                invoice_date = invoice_date_cache[project_id]
+                invoice_cutoff_dt_cache[project_id] = pd.to_datetime(invoice_date) if invoice_date else None
+
+            last_invoice_date = invoice_cutoff_dt_cache[project_id] or start_dt
 
             # Check if the task's end_time is after the last invoice date
-            end_time = pd.to_datetime(record['endtime'])
-            if end_time < last_invoice_date:
+            if end_dt < last_invoice_date:
                 print(f"Removing task '{record['taskname']}' for project '{project_name}' because its end time is before the last invoice date.")
                 continue
+
+            record['_start_dt'] = start_dt
+            record['_end_dt'] = end_dt
 
             # Store the record in the project's time records
             if project_name not in project_time_records:
@@ -259,7 +348,7 @@ def process_time_per_contact(trackedfrom, trackedto):
         # Check if any time records for this project fall within the previous month
         for project_name, records in project_time_records.items():
             has_prev_month_records = any(
-                prev_month_start <= pd.to_datetime(record['endtime']) <= prev_month_end
+                prev_month_start <= record['_end_dt'] <= prev_month_end
                 for record in records
             )
 
@@ -269,11 +358,11 @@ def process_time_per_contact(trackedfrom, trackedto):
                 for record in records:
                     task_name = record['taskname']
                     start_time = record['starttime']
-                    task_date = pd.to_datetime(start_time.split('T')[0]).strftime('%b %d, %Y')
+                    task_date = record['_start_dt'].strftime('%b %d, %Y')
                     notes = record.get('notes', '')
                     time_spent = calculate_time_spent(start_time, record['endtime'])
-                    formatted_start_time = format_time(start_time)
-                    formatted_end_time = format_time(record['endtime'])
+                    formatted_start_time = record['_start_dt']
+                    formatted_end_time = record['_end_dt']
 
                     if project_name not in project_data_tasks:
                         project_data_tasks[project_name] = []
