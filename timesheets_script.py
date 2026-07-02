@@ -1,4 +1,6 @@
 import os
+import signal
+import sys
 import time
 from datetime import datetime, timedelta
 
@@ -26,13 +28,33 @@ headers = {
 
 pd.set_option('display.max_colwidth', None)
 
-trackedfrom = '2025-04-01'  # Specify start date for the time range
-trackedto = '2026-05-31'  # Specify end date for the time range
+REQUEST_TIMEOUT_SECONDS = 30
+
+trackedfrom = '2025-09-01'  # Specify start date for the time range
+trackedto = '2026-06-30'  # Specify end date for the time range
+folderName = 'Timesheets June 2026'  # Specify the folder name for output files
+
+# Cache invoice cut-off dates by project to avoid repeated API calls.
+LAST_INVOICE_DATE_CACHE = {}
+
+
+def _interrupt_signal_handler(signum, frame):
+    # Surface where KeyboardInterrupt is coming from when run is cancelled externally.
+    print("\nReceived interrupt signal (SIGINT). This usually means the run was cancelled by the IDE, task runner, or Ctrl+C.")
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, _interrupt_signal_handler)
 
 # Function to get all contacts of type 'staff'
 def get_staff_contacts():
     url = f'{BASE_URL}/contacts'
-    response = requests.get(url, headers=headers, auth=HTTPBasicAuth(USERNAME, PASSWORD))
+    response = requests.get(
+        url,
+        headers=headers,
+        auth=HTTPBasicAuth(USERNAME, PASSWORD),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     if response.status_code == 200:
         contacts = response.json()['contacts']
         print("Collected staff names...")
@@ -43,7 +65,12 @@ def get_staff_contacts():
 # Second request: Function to get task-specific time details by contact
 def get_contact_task_details(contact_id, trackedfrom, trackedto):
     url = f'{BASE_URL}/contacts/{contact_id}/time?trackedfrom={trackedfrom}&trackedto={trackedto}&fields=dates,project,task,notes,contact,category'
-    response = requests.get(url, headers=headers, auth=HTTPBasicAuth(USERNAME, PASSWORD))
+    response = requests.get(
+        url,
+        headers=headers,
+        auth=HTTPBasicAuth(USERNAME, PASSWORD),
+        timeout=REQUEST_TIMEOUT_SECONDS,
+    )
     if response.status_code == 200:
         task_times = response.json()['timerecords']
         filtered_records = [record for record in task_times if record['categoryname'] in ["On Hold", "Current Timed Projects"]]
@@ -68,7 +95,12 @@ def get_first_day_of_month_in_last_paid_invoice_date(project_id, max_retries=3, 
     
     while retries < max_retries:
         try:
-            response = requests.get(url, headers=headers, auth=HTTPBasicAuth(USERNAME, PASSWORD))
+            response = requests.get(
+                url,
+                headers=headers,
+                auth=HTTPBasicAuth(USERNAME, PASSWORD),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             if response.status_code == 200:
                 invoices = response.json().get('invoices', [])
                 # paid_invoices = [inv for inv in invoices if inv['status'] == 'paid']
@@ -113,12 +145,20 @@ def get_first_day_of_month_in_last_paid_invoice_date(project_id, max_retries=3, 
     return None
 
 def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
+    if project_id in LAST_INVOICE_DATE_CACHE:
+        return LAST_INVOICE_DATE_CACHE[project_id]
+
     url = f"{BASE_URL}/projects/{project_id}/invoices/"
     retries = 0
 
     while retries < max_retries:
         try:
-            response = requests.get(url, headers=headers, auth=HTTPBasicAuth(USERNAME, PASSWORD))
+            response = requests.get(
+                url,
+                headers=headers,
+                auth=HTTPBasicAuth(USERNAME, PASSWORD),
+                timeout=REQUEST_TIMEOUT_SECONDS,
+            )
             if response.status_code == 200:
                 invoices = response.json().get('invoices', [])
                 if invoices:
@@ -135,8 +175,10 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
                     formatted_date = next_day.strftime("%Y-%m-%dT%H:%M:%S")
 
                     print(f"Last invoice for project {project_id} found: {formatted_date} (day after latest invoice date)")
+                    LAST_INVOICE_DATE_CACHE[project_id] = formatted_date
                     return formatted_date
 
+                LAST_INVOICE_DATE_CACHE[project_id] = None
                 return None
             elif response.status_code >= 500:
                 retries += 1
@@ -145,6 +187,7 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
                 time.sleep(wait_time)
             else:
                 print(f"Client error {response.status_code} for project {project_id}: {response.text}")
+                LAST_INVOICE_DATE_CACHE[project_id] = None
                 return None
         except requests.exceptions.RequestException as e:
             retries += 1
@@ -153,6 +196,7 @@ def get_last_invoice_date(project_id, max_retries=3, backoff_factor=2):
             time.sleep(wait_time)
 
     print(f"Failed to get invoices for project {project_id} after {max_retries} retries. Skipping project.")
+    LAST_INVOICE_DATE_CACHE[project_id] = None
     return None
 
 # Calculate the start and end dates for the previous month
@@ -167,6 +211,7 @@ def get_month_dates_for_range(end_date_str):
 def process_time_per_contact(trackedfrom, trackedto):
     staff_contacts = get_staff_contacts()
     project_data_tasks = {}
+    invoice_date_cache = {}
 
     # Get the date range for the previous month
     prev_month_start, prev_month_end = get_month_dates_for_range(trackedto)
@@ -191,7 +236,9 @@ def process_time_per_contact(trackedfrom, trackedto):
             project_number = record['projectnumber']
 
             # Get the last invoice date for the project (actual date, not first of month)
-            last_invoice_date = get_last_invoice_date(project_id)
+            if project_id not in invoice_date_cache:
+                invoice_date_cache[project_id] = get_last_invoice_date(project_id)
+            last_invoice_date = invoice_date_cache[project_id]
             if last_invoice_date:
                 last_invoice_date = pd.to_datetime(last_invoice_date)
             else:
@@ -345,11 +392,14 @@ def hide_columns(worksheet, columns_to_hide):
 
 # Main function to write separate Excel files per project
 def main():
+    run_start = time.perf_counter()
+    files_generated = 0
+
     # Process time for all staff contacts
     project_data_tasks = process_time_per_contact(trackedfrom, trackedto)
 
     # Create output directory if it doesn't exist
-    output_dir = 'output/projects/Timesheets May 2026'
+    output_dir = os.path.join('output', 'projects', folderName)
     os.makedirs(output_dir, exist_ok=True)
 
         # Write each project's data to a separate Excel file
@@ -431,6 +481,14 @@ def main():
             set_font(worksheet, font_name="Calibri", font_size=10)
 
         print(f"Time data and pivot table for project '{project_name}' saved to {excel_file}")
+        files_generated += 1
+
+    elapsed_seconds = time.perf_counter() - run_start
+    print(f"Run complete in {elapsed_seconds:.2f} seconds. Files generated: {files_generated}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Execution interrupted externally. If this happens around 10 seconds consistently, check your VS Code run/debug/task configuration for auto-cancel/timeouts.")
+        sys.exit(130)
